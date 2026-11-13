@@ -31,3 +31,5 @@ debug = false
 rpath = false
 
 [dependencies]
+rusqlite = { version = "0.42.0", features = ["bundled"] }
+sysinfo = { version = "0.40.3", default-features = false, features = ["system"] }

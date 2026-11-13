@@ -3,6 +3,10 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use rusqlite::{Connection, OptionalExtension, params};
+use sysinfo::{Pid, ProcessesToUpdate, System};
 
 const HELP: &str = "jj - change directories with a directory history\n\nUsage: jj [DIRECTORY]\n       jj --keep <DIRECTORY>\n       jj --pop [NUMBER]\n       jj --queue\n       jj --init <bash|zsh>\n\nSet up your shell with: eval \"$(jj --init bash)\" (or zsh).\nThe queue is listed most recent first; --pop defaults to 1.\nKept directories can be revisited by their final path component.\n";
 
@@ -20,8 +24,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             return Err("usage: jj --init <bash|zsh>".into());
         }
         // The shell owns the queue identifier and performs the actual directory change.
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         println!(
-            r#"export JJ_QUEUE_FILE="${{TMPDIR:-/tmp}}/jj-queue-${{UID:-$(id -u)}}-$$"
+            r#"export JJ_SESSION_ID="{timestamp}-$$"
+export JJ_SHELL_PID="$$"
 jj() {{
     case "$1" in
         --queue|--help|-h|--init) command jj "$@" ;;
@@ -37,10 +43,38 @@ jj() {{
         print!("{HELP}");
         return Ok(());
     }
-    let queue_file = env::var_os("JJ_QUEUE_FILE")
+    let legacy_queue = env::var_os("JJ_QUEUE_FILE");
+    let session_id = env::var("JJ_SESSION_ID").ok().filter(|id| !id.is_empty());
+    let queue_id = session_id
+        .clone()
+        .or_else(|| {
+            legacy_queue
+                .as_ref()
+                .map(|id| id.to_string_lossy().into_owned())
+        })
         .ok_or("shell integration is not initialized; run eval \"$(jj --init bash)\" (or zsh)")?;
-    let queue_path = Path::new(&queue_file);
-    let mut queue = read_queue(queue_path)?;
+    let mut db = open_database()?;
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    migrate_legacy(
+        &tx,
+        if session_id.is_none() {
+            legacy_queue.as_deref().map(Path::new)
+        } else {
+            None
+        },
+    )?;
+    if session_id.is_some() {
+        maintain_sessions(&tx, &queue_id)?;
+    }
+    let mut queue = {
+        let mut statement = tx.prepare("SELECT path FROM queue WHERE shell = ?1 ORDER BY id")?;
+        let entries = statement.query_map([queue_id.as_str()], |row| row.get::<_, String>(0))?;
+        entries
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>()
+    };
     if args.first().is_some_and(|a| a == "--queue") {
         if args.len() != 1 {
             return Err("usage: jj --queue".into());
@@ -48,6 +82,7 @@ jj() {{
         for (index, path) in queue.iter().rev().enumerate() {
             println!("{}  {}", index + 1, path.display());
         }
+        tx.commit()?;
         return Ok(());
     }
     let current = env::current_dir()?;
@@ -77,14 +112,11 @@ jj() {{
             return Err("usage: jj --keep <DIRECTORY>".into());
         }
         let path = canonical_directory(Path::new(&args[1]))?;
-        let kept_path = kept_file()?;
-        let mut kept = read_queue(&kept_path)?;
-        kept.retain(|entry| entry != &path);
-        kept.push(path.clone());
-        if let Some(parent) = kept_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        write_queue(&kept_path, &kept)?;
+        tx.execute("DELETE FROM kept WHERE path = ?1", [path.to_str().unwrap()])?;
+        tx.execute(
+            "INSERT INTO kept(path) VALUES (?1)",
+            [path.to_str().unwrap()],
+        )?;
         path
     } else {
         if args.len() > 1 {
@@ -103,7 +135,15 @@ jj() {{
             && path.components().count() == 1
             && path.file_name() == Some(path.as_os_str())
         {
-            let kept = read_queue(&kept_file()?)?;
+            let kept = {
+                let mut statement = tx.prepare("SELECT path FROM kept ORDER BY id")?;
+                let entries = statement.query_map([], |row| row.get::<_, String>(0))?;
+                entries
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>()
+            };
             let candidate = kept
                 .iter()
                 .rev()
@@ -116,17 +156,148 @@ jj() {{
     if args.first().is_none_or(|a| a != "--pop") && current != destination {
         queue.push(current);
     }
-    write_queue(queue_path, &queue)?;
+    tx.execute("DELETE FROM queue WHERE shell = ?1", [queue_id.as_str()])?;
+    for path in &queue {
+        let value = path.to_str().ok_or("directory names must be valid UTF-8")?;
+        tx.execute(
+            "INSERT INTO queue(shell, path) VALUES (?1, ?2)",
+            params![queue_id.as_str(), value],
+        )?;
+    }
+    tx.commit()?;
     println!("{}", destination.display());
     Ok(())
 }
 
-fn kept_file() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let base = match env::var_os("XDG_DATA_HOME").filter(|value| Path::new(value).is_absolute()) {
+fn state_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let base = match env::var_os("XDG_STATE_HOME").filter(|value| Path::new(value).is_absolute()) {
         Some(value) => PathBuf::from(value),
-        None => PathBuf::from(env::var_os("HOME").ok_or("HOME is not set")?).join(".local/share"),
+        None => PathBuf::from(env::var_os("HOME").ok_or("HOME is not set")?).join(".local/state"),
     };
-    Ok(base.join("jump-jotter/kept"))
+    Ok(base.join("jj"))
+}
+
+fn open_database() -> Result<Connection, Box<dyn std::error::Error>> {
+    let directory = state_dir()?;
+    fs::create_dir_all(&directory)?;
+    let db = Connection::open(directory.join("jj.sqlite3"))?;
+    db.busy_timeout(Duration::from_secs(5))?;
+    db.execute_batch("CREATE TABLE IF NOT EXISTS kept (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
+        CREATE TABLE IF NOT EXISTS queue (id INTEGER PRIMARY KEY, shell TEXT NOT NULL, path TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS queue_shell ON queue(shell, id);
+        CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, pid INTEGER NOT NULL, started INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY);")?;
+    Ok(db)
+}
+
+fn maintain_sessions(db: &Connection, session_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(pid) = env::var("JJ_SHELL_PID")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+    else {
+        return Ok(());
+    };
+    let Ok(mut system) = System::new() else {
+        return Ok(());
+    };
+    system.refresh_processes(ProcessesToUpdate::All, true);
+    // If process inspection is restricted, preserve all queues rather than guessing.
+    let Some(current) = system.process(Pid::from_u32(pid)) else {
+        return Ok(());
+    };
+    let started = current.start_time();
+    if started == 0 {
+        return Ok(());
+    }
+    let stale = {
+        let mut stmt = db.prepare("SELECT id, pid, started FROM sessions WHERE id != ?1")?;
+        let rows = stmt.query_map([session_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut stale = Vec::new();
+        for row in rows {
+            let (id, pid, started) = row?;
+            match system.process(Pid::from_u32(pid)) {
+                None => stale.push(id),
+                Some(process)
+                    if process.start_time() != 0
+                        && i64::try_from(process.start_time()).ok() != Some(started) =>
+                {
+                    stale.push(id)
+                }
+                _ => {}
+            }
+        }
+        stale
+    };
+    for id in stale {
+        db.execute("DELETE FROM queue WHERE shell = ?1", [&id])?;
+        db.execute("DELETE FROM sessions WHERE id = ?1", [&id])?;
+    }
+    db.execute(
+        "INSERT OR IGNORE INTO sessions(id, pid, started) VALUES (?1, ?2, ?3)",
+        params![session_id, pid, i64::try_from(started)?],
+    )?;
+    Ok(())
+}
+
+fn migrate_legacy(
+    db: &Connection,
+    queue_path: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let migrated: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM migrations WHERE name = 'kept')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !migrated {
+        let state_file = state_dir()?.join("kept");
+        let base =
+            match env::var_os("XDG_DATA_HOME").filter(|value| Path::new(value).is_absolute()) {
+                Some(value) => PathBuf::from(value),
+                None => PathBuf::from(env::var_os("HOME").ok_or("HOME is not set")?)
+                    .join(".local/share"),
+            };
+        let legacy = if state_file.exists() {
+            state_file
+        } else {
+            base.join("jump-jotter/kept")
+        };
+        for path in read_queue(&legacy)? {
+            let value = path.to_str().ok_or("invalid legacy kept path")?;
+            db.execute("DELETE FROM kept WHERE path = ?1", [value])?;
+            db.execute("INSERT INTO kept(path) VALUES (?1)", [value])?;
+        }
+        db.execute("INSERT INTO migrations(name) VALUES ('kept')", [])?;
+    }
+    let Some(queue_path) = queue_path else {
+        return Ok(());
+    };
+    let id = queue_path.to_string_lossy();
+    let marker = format!("queue:{id}");
+    let migrated = db
+        .query_row(
+            "SELECT 1 FROM migrations WHERE name = ?1",
+            [&marker],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !migrated {
+        for path in read_queue(queue_path)? {
+            let value = path.to_str().ok_or("invalid legacy queue path")?;
+            db.execute(
+                "INSERT INTO queue(shell, path) VALUES (?1, ?2)",
+                params![id.as_ref(), value],
+            )?;
+        }
+        db.execute("INSERT INTO migrations(name) VALUES (?1)", [&marker])?;
+    }
+    Ok(())
 }
 
 fn canonical_directory(path: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -155,22 +326,4 @@ fn read_queue(path: &Path) -> io::Result<Vec<PathBuf>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(error) => Err(error),
     }
-}
-
-fn write_queue(path: &Path, queue: &[PathBuf]) -> io::Result<()> {
-    let mut data = String::new();
-    for entry in queue {
-        let entry = entry
-            .to_str()
-            .filter(|s| !s.contains(['\n', '\r']))
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "directory names must be valid UTF-8 and contain no newlines",
-                )
-            })?;
-        data.push_str(entry);
-        data.push('\n');
-    }
-    fs::write(path, data)
 }
