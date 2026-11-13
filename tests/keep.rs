@@ -1,5 +1,51 @@
 #[cfg(unix)]
 #[test]
+fn no_arguments_goes_home_with_nounset() {
+    use std::{
+        fs,
+        process::Command,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    let root = std::env::temp_dir().join(format!(
+        "jj-home-test-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    for shell in ["bash", "zsh"] {
+        let output = match Command::new(shell)
+            .arg("-uc")
+            .arg(
+                "eval \"$(\"$JJ_BIN\" --init \"$JJ_SHELL\")\"; cd /; jj; test \"$PWD\" = \"$HOME\"",
+            )
+            .env("JJ_BIN", env!("CARGO_BIN_EXE_jj"))
+            .env("JJ_SHELL", shell)
+            .env("HOME", &root)
+            .env("XDG_STATE_HOME", root.join("state"))
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) if shell == "zsh" && error.kind() == std::io::ErrorKind::NotFound => {
+                continue;
+            }
+            Err(error) => panic!("failed to run {shell}: {error}"),
+        };
+        assert!(
+            output.status.success(),
+            "{shell}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(!root.join("state").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn kept_directories_work_across_shells() {
     use std::process::Command;
 

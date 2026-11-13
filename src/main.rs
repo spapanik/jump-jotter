@@ -29,6 +29,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             r#"export JJ_SESSION_ID="{timestamp}-$$"
 export JJ_SHELL_PID="$$"
 jj() {{
+    if [ "$#" -eq 0 ]; then
+        builtin cd -- "$HOME"
+        return
+    fi
     case "$1" in
         --queue|--help|-h|--init) command jj "$@" ;;
         *) local destination

@@ -11,7 +11,8 @@ eval "$(jj --init bash)"  # use zsh instead for zsh
 ```
 
 Open a new shell or reload the configuration. `jj path` changes directory, and
-`jj` goes home. Each change adds the directory you left to that shell's queue.
+`jj` goes home directly. Other `jj` changes add the directory you left to that
+shell's queue.
 
 - `jj --queue` lists the queue, most recent first, with one-based numbers.
 - `jj --pop` returns to the previous directory.
