@@ -4,7 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process;
 
-const HELP: &str = "jj - change directories with a directory history\n\nUsage: jj [DIRECTORY]\n       jj --pop [NUMBER]\n       jj --queue\n       jj --init <bash|zsh>\n\nSet up your shell with: eval \"$(jj --init bash)\" (or zsh).\nThe queue is listed most recent first; --pop defaults to 1.\n";
+const HELP: &str = "jj - change directories with a directory history\n\nUsage: jj [DIRECTORY]\n       jj --keep <DIRECTORY>\n       jj --pop [NUMBER]\n       jj --queue\n       jj --init <bash|zsh>\n\nSet up your shell with: eval \"$(jj --init bash)\" (or zsh).\nThe queue is listed most recent first; --pop defaults to 1.\nKept directories can be revisited by their final path component.\n";
 
 fn main() {
     if let Err(error) = run() {
@@ -51,6 +51,7 @@ jj() {{
         return Ok(());
     }
     let current = env::current_dir()?;
+    let keep = args.first().is_some_and(|a| a == "--keep");
     let destination = if args.first().is_some_and(|a| a == "--pop") {
         if args.len() > 2 {
             return Err("usage: jj --pop [NUMBER]".into());
@@ -71,6 +72,20 @@ jj() {{
         validate_directory(&path)?;
         queue.truncate(target);
         path
+    } else if keep {
+        if args.len() != 2 {
+            return Err("usage: jj --keep <DIRECTORY>".into());
+        }
+        let path = canonical_directory(Path::new(&args[1]))?;
+        let kept_path = kept_file()?;
+        let mut kept = read_queue(&kept_path)?;
+        kept.retain(|entry| entry != &path);
+        kept.push(path.clone());
+        if let Some(parent) = kept_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        write_queue(&kept_path, &kept)?;
+        path
     } else {
         if args.len() > 1 {
             return Err("usage: jj [DIRECTORY]".into());
@@ -82,8 +97,21 @@ jj() {{
             Some(arg) => PathBuf::from(arg),
             None => PathBuf::from(env::var_os("HOME").ok_or("HOME is not set")?),
         };
-        validate_directory(&path)?;
-        fs::canonicalize(path)?
+        if path.is_dir() {
+            canonical_directory(&path)?
+        } else if args.first().is_some()
+            && path.components().count() == 1
+            && path.file_name() == Some(path.as_os_str())
+        {
+            let kept = read_queue(&kept_file()?)?;
+            let candidate = kept
+                .iter()
+                .rev()
+                .find(|entry| entry.file_name() == path.file_name() && entry.is_dir());
+            canonical_directory(candidate.unwrap_or(&path))?
+        } else {
+            canonical_directory(&path)?
+        }
     };
     if args.first().is_none_or(|a| a != "--pop") && current != destination {
         queue.push(current);
@@ -91,6 +119,21 @@ jj() {{
     write_queue(queue_path, &queue)?;
     println!("{}", destination.display());
     Ok(())
+}
+
+fn kept_file() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let base = match env::var_os("XDG_DATA_HOME").filter(|value| Path::new(value).is_absolute()) {
+        Some(value) => PathBuf::from(value),
+        None => PathBuf::from(env::var_os("HOME").ok_or("HOME is not set")?).join(".local/share"),
+    };
+    Ok(base.join("jump-jotter/kept"))
+}
+
+fn canonical_directory(path: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    validate_directory(path)?;
+    let path = fs::canonicalize(path)?;
+    validate_directory(&path)?;
+    Ok(path)
 }
 
 fn validate_directory(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
