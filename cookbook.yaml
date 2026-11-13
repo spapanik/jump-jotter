@@ -1,0 +1,22 @@
+$globals:
+  version: "8.1"
+  vars:
+    cache: .cache
+    src: src
+    rust_compiler: cargo build
+    rust_compiler_flags: --release
+
+build:
+  alias: target/release/jj
+
+format:
+  phony: true
+  commands:
+    - rustfmt ${src}/*.rs
+
+target/release/jj:
+  requires:
+    - ${src}/main.rs
+    - Cargo.toml
+  commands:
+    - ${rust_compiler} ${rust_compiler_flags}

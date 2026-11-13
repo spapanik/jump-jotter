@@ -1,0 +1,15 @@
+# compiled output
+/bin/
+/target/
+
+# cache
+/.cache/
+
+# installation/build artifacts
+.yamk/
+Cargo.lock
+
+# local dev
+/cookbook.yaml.d/
+local/
+local.*

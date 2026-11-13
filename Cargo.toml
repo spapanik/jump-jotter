@@ -1,0 +1,32 @@
+[package]
+name = "jump-jotter"
+version = "0.1.0"
+edition = "2024"
+
+authors = [
+    "Stephanos Kuma <stephanos@kuma.ai>",
+]
+description = "A directory changer with per-shell directory history"
+license = "BSD-3-Clause"
+repository = "https://github.com/spapanik/jump-jotter"
+keywords = ["cli", "directory", "shell", "navigation"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "jj"
+path = "src/main.rs"
+
+[profile.test]
+opt-level = 2
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = 3
+panic = "abort"
+strip = true
+overflow-checks = false
+debug = false
+rpath = false
+
+[dependencies]
