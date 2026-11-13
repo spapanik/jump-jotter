@@ -7,6 +7,7 @@ authors = [
     "Stephanos Kuma <stephanos@kuma.ai>",
 ]
 description = "A directory changer with per-shell directory history"
+readme = "docs/README.md"
 license = "BSD-3-Clause"
 repository = "https://github.com/spapanik/jump-jotter"
 keywords = ["cli", "directory", "shell", "navigation"]
