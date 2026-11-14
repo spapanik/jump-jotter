@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension, params};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
-const HELP: &str = "jj - change directories with a directory history\n\nUsage: jj [DIRECTORY]\n       jj --keep <DIRECTORY>\n       jj --pop [NUMBER]\n       jj --queue\n       jj --init <bash|zsh>\n\nSet up your shell with: eval \"$(jj --init bash)\" (or zsh).\nThe queue is listed most recent first; --pop defaults to 1.\nKept directories can be revisited by their final path component.\n";
+const HELP: &str = "jj - change directories with a directory history\n\nUsage: jj [DIRECTORY]\n       jj --keep [DIRECTORY]\n       jj --pop [NUMBER]\n       jj --queue\n       jj --init [--use-aliases] <bash|zsh>\n\nSet up your shell with: eval \"$(jj --init bash)\" (or zsh).\nOptions: -k, --keep; -p, --pop; -q, --queue; -V, --version; -h, --help.\nThe queue is listed most recent first; --pop defaults to 1.\n--keep defaults to the current directory.\nKept directories can be revisited by their final path component.\n";
 
 fn main() {
     if let Err(error) = run() {
@@ -20,8 +20,12 @@ fn main() {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = env::args_os().skip(1).collect();
     if args.first().is_some_and(|a| a == "--init") {
-        if args.len() != 2 || !(args[1] == "bash" || args[1] == "zsh") {
-            return Err("usage: jj --init <bash|zsh>".into());
+        let use_alias = args.get(1).is_some_and(|a| a == "--use-aliases");
+        let shell = if use_alias { args.get(2) } else { args.get(1) };
+        if args.len() != if use_alias { 3 } else { 2 }
+            || !shell.is_some_and(|s| s == "bash" || s == "zsh")
+        {
+            return Err("usage: jj --init [--use-aliases] <bash|zsh>".into());
         }
         // The shell owns the queue identifier and performs the actual directory change.
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
@@ -34,13 +38,20 @@ jj() {{
         return
     fi
     case "$1" in
-        --queue|--help|-h|--init) command jj "$@" ;;
+        --queue|-q|--help|-h|--version|-V|--init) command jj "$@" ;;
         *) local destination
            destination="$(command jj "$@")" || return
            builtin cd -- "$destination" ;;
     esac
 }}"#
         );
+        if use_alias {
+            println!("alias jjq='jj --queue'\nalias jjk='jj --keep'\nalias jjp='jj --pop'");
+        }
+        return Ok(());
+    }
+    if args.first().is_some_and(|a| a == "--version" || a == "-V") {
+        println!("jj {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
     if args.first().is_some_and(|a| a == "--help" || a == "-h") {
@@ -79,7 +90,7 @@ jj() {{
             .map(PathBuf::from)
             .collect::<Vec<_>>()
     };
-    if args.first().is_some_and(|a| a == "--queue") {
+    if args.first().is_some_and(|a| a == "--queue" || a == "-q") {
         if args.len() != 1 {
             return Err("usage: jj --queue".into());
         }
@@ -90,8 +101,9 @@ jj() {{
         return Ok(());
     }
     let current = env::current_dir()?;
-    let keep = args.first().is_some_and(|a| a == "--keep");
-    let destination = if args.first().is_some_and(|a| a == "--pop") {
+    let keep = args.first().is_some_and(|a| a == "--keep" || a == "-k");
+    let pop = args.first().is_some_and(|a| a == "--pop" || a == "-p");
+    let destination = if pop {
         if args.len() > 2 {
             return Err("usage: jj --pop [NUMBER]".into());
         }
@@ -112,10 +124,10 @@ jj() {{
         queue.truncate(target);
         path
     } else if keep {
-        if args.len() != 2 {
-            return Err("usage: jj --keep <DIRECTORY>".into());
+        if args.len() > 2 {
+            return Err("usage: jj --keep [DIRECTORY]".into());
         }
-        let path = canonical_directory(Path::new(&args[1]))?;
+        let path = canonical_directory(args.get(1).map_or(Path::new("."), Path::new))?;
         tx.execute("DELETE FROM kept WHERE path = ?1", [path.to_str().unwrap()])?;
         tx.execute(
             "INSERT INTO kept(path) VALUES (?1)",
@@ -157,7 +169,7 @@ jj() {{
             canonical_directory(&path)?
         }
     };
-    if args.first().is_none_or(|a| a != "--pop") && current != destination {
+    if !pop && current != destination {
         queue.push(current);
     }
     tx.execute("DELETE FROM queue WHERE shell = ?1", [queue_id.as_str()])?;

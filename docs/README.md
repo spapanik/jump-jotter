@@ -10,18 +10,24 @@ shell configuration (`~/.bashrc` or `~/.zshrc`):
 eval "$(jj --init bash)"  # use zsh instead for zsh
 ```
 
+To also define `jjq`, `jjk`, and `jjp` aliases for `jj --queue`,
+`jj --keep`, and `jj --pop`, use `jj --init --use-aliases bash` (or `zsh`)
+in the initialization line.
+
 Open a new shell or reload the configuration. `jj path` changes directory, and
 `jj` goes home directly. Other `jj` changes add the directory you left to that
 shell's queue.
 
-- `jj --queue` lists the queue, most recent first, with one-based numbers.
-- `jj --pop` returns to the previous directory.
+- `jj --queue` (or `jj -q`) lists the queue, most recent first, with one-based numbers.
+- `jj --pop` (or `jj -p`) returns to the previous directory.
 - `jj --pop 3` returns to the directory from three visits ago, removing those three
   entries from the history.
 - `jj --keep Downloads` changes to `Downloads` and saves its resolved absolute
-  path. `jj --keep .` saves the current directory without moving.
+  path. `jj --keep` (or `jj -k`) saves the current directory without moving.
 - `jj Downloads` opens a local `Downloads` directory if one exists; otherwise,
   it opens the most recently kept directory named `Downloads`.
+
+`jj --version` or `jj -V` prints the version.
 
 Kept directories are shared between shells and persist across sessions in a
 SQLite database at `$XDG_STATE_HOME/jj/jj.sqlite3`, or

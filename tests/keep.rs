@@ -193,3 +193,72 @@ fn removes_queue_after_shell_exits() {
     drop(db);
     fs::remove_dir_all(root).unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+fn short_options_and_optional_aliases_work() {
+    use std::process::Command;
+
+    for shell in ["bash", "zsh"] {
+        let output = match Command::new(shell)
+            .arg("-c")
+            .arg(
+                r#"
+set -eu
+if [ "$JJ_SHELL" = bash ]; then shopt -s expand_aliases; fi
+root=$(mktemp -d)
+root=$(cd "$root" && pwd -P)
+trap 'rm -rf "$root"' EXIT
+export HOME="$root/home" XDG_STATE_HOME="$root/state"
+export PATH="$(dirname "$JJ_BIN"):$PATH"
+mkdir -p "$HOME" "$root/start" "$root/other"
+eval "$(jj --init --use-aliases "$JJ_SHELL")"
+cd "$root/start"
+jj -k
+cd "$root/other"
+jj start
+test "$PWD" = "$root/start"
+test "$(jj -q)" = "1  $root/other"
+jj -p
+test "$PWD" = "$root/other"
+test -z "$(jj -q)"
+eval jjk
+test "$(eval jjq)" = ""
+jj "$root/start"
+eval jjp
+test "$PWD" = "$root/other"
+test "$(jj -V)" = "jj $JJ_VERSION"
+test "$(jj --version)" = "jj $JJ_VERSION"
+"#,
+            )
+            .env("JJ_BIN", env!("CARGO_BIN_EXE_jj"))
+            .env("JJ_VERSION", env!("CARGO_PKG_VERSION"))
+            .env("JJ_SHELL", shell)
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) if shell == "zsh" && error.kind() == std::io::ErrorKind::NotFound => {
+                continue;
+            }
+            Err(error) => panic!("failed to run {shell}: {error}"),
+        };
+        assert!(
+            output.status.success(),
+            "{shell}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    for option in ["--version", "-V"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_jj"))
+            .arg(option)
+            .env_remove("JJ_SESSION_ID")
+            .env_remove("JJ_QUEUE_FILE")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("jj {}\n", env!("CARGO_PKG_VERSION"))
+        );
+    }
+}
