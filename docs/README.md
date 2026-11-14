@@ -10,8 +10,8 @@ shell configuration (`~/.bashrc` or `~/.zshrc`):
 eval "$(jj --init bash)"  # use zsh instead for zsh
 ```
 
-To also define `jjq`, `jjk`, and `jjp` aliases for `jj --queue`,
-`jj --keep`, and `jj --pop`, use `jj --init --use-aliases bash` (or `zsh`)
+To also define `jjq`, `jjk`, `jjp`, and `jjpi` aliases for `jj --queue`,
+`jj --keep`, `jj --pop`, and `jj --pop --interactive`, use `jj --init --use-aliases bash` (or `zsh`)
 in the initialization line.
 
 Open a new shell or reload the configuration. `jj path` changes directory, and
@@ -20,6 +20,8 @@ shell's queue.
 
 - `jj --queue` (or `jj -q`) lists the queue, most recent first, with one-based numbers.
 - `jj --pop` (or `jj -p`) returns to the previous directory.
+- `jj --pop --interactive` (or `jj -pi` / `jj -ip`) lets you select an entry with the
+  arrow keys and Enter. Escape, Ctrl-C, or `q` cancels.
 - `jj --pop 3` returns to the directory from three visits ago, removing those three
   entries from the history.
 - `jj --keep Downloads` changes to `Downloads` and saves its resolved absolute

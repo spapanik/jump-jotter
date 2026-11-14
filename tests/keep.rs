@@ -262,3 +262,48 @@ test "$(jj --version)" = "jj $JJ_VERSION"
         );
     }
 }
+
+#[test]
+fn interactive_pop_accepts_flag_orders() {
+    use std::{
+        fs,
+        process::Command,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    let root = std::env::temp_dir().join(format!(
+        "jj-interactive-options-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    for args in [
+        &["-pi"][..],
+        &["-ip"],
+        &["-p", "-i"],
+        &["-i", "-p"],
+        &["--pop", "--interactive"],
+        &["--interactive", "--pop"],
+        &["--interactive", "-p"],
+        &["-i", "--pop"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_jj"))
+            .args(args)
+            .env("HOME", &root)
+            .env("XDG_STATE_HOME", &root)
+            .env("JJ_SESSION_ID", "interactive-options-test")
+            .env_remove("JJ_SHELL_PID")
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("queue is empty"),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+}

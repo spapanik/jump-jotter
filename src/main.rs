@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
-use std::io;
+use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -8,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension, params};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
-const HELP: &str = "jj - change directories with a directory history\n\nUsage: jj [DIRECTORY]\n       jj --keep [DIRECTORY]\n       jj --pop [NUMBER]\n       jj --queue\n       jj --init [--use-aliases] <bash|zsh>\n\nSet up your shell with: eval \"$(jj --init bash)\" (or zsh).\nOptions: -k, --keep; -p, --pop; -q, --queue; -V, --version; -h, --help.\nThe queue is listed most recent first; --pop defaults to 1.\n--keep defaults to the current directory.\nKept directories can be revisited by their final path component.\n";
+const HELP: &str = "jj - change directories with a directory history\n\nUsage: jj [DIRECTORY]\n       jj --keep [DIRECTORY]\n       jj --pop [NUMBER|--interactive|-i]\n       jj --queue\n       jj --init [--use-aliases] <bash|zsh>\n\nSet up your shell with: eval \"$(jj --init bash)\" (or zsh).\nOptions: -k, --keep; -p, --pop; -q, --queue; -V, --version; -h, --help.\nThe queue is listed most recent first; --pop defaults to 1.\nUse --pop --interactive to select with the arrow keys.\n--keep defaults to the current directory.\nKept directories can be revisited by their final path component.\n";
 
 fn main() {
     if let Err(error) = run() {
@@ -18,7 +19,17 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<_> = env::args_os().skip(1).collect();
+    let mut args: Vec<_> = env::args_os().skip(1).collect();
+    // Normalize the equivalent interactive pop spellings before dispatch.
+    if args.first().is_some_and(|a| a == "-pi" || a == "-ip") {
+        args.splice(0..1, ["--pop".into(), "--interactive".into()]);
+    } else if args
+        .first()
+        .is_some_and(|a| a == "-i" || a == "--interactive")
+        && args.get(1).is_some_and(|a| a == "-p" || a == "--pop")
+    {
+        args.swap(0, 1);
+    }
     if args.first().is_some_and(|a| a == "--init") {
         let use_alias = args.get(1).is_some_and(|a| a == "--use-aliases");
         let shell = if use_alias { args.get(2) } else { args.get(1) };
@@ -46,7 +57,9 @@ jj() {{
 }}"#
         );
         if use_alias {
-            println!("alias jjq='jj --queue'\nalias jjk='jj --keep'\nalias jjp='jj --pop'");
+            println!(
+                "alias jjq='jj --queue'\nalias jjk='jj --keep'\nalias jjp='jj --pop'\nalias jjpi='jj --pop --interactive'"
+            );
         }
         return Ok(());
     }
@@ -69,7 +82,7 @@ jj() {{
         })
         .ok_or("shell integration is not initialized; run eval \"$(jj --init bash)\" (or zsh)")?;
     let mut db = open_database()?;
-    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let mut tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     migrate_legacy(
         &tx,
         if session_id.is_none() {
@@ -105,9 +118,32 @@ jj() {{
     let pop = args.first().is_some_and(|a| a == "--pop" || a == "-p");
     let destination = if pop {
         if args.len() > 2 {
-            return Err("usage: jj --pop [NUMBER]".into());
+            return Err("usage: jj --pop [NUMBER|--interactive|-i]".into());
         }
         let index: usize = match args.get(1) {
+            Some(value) if value == "--interactive" || value == "-i" => {
+                if queue.is_empty() {
+                    return Err("queue is empty".into());
+                }
+                tx.commit()?;
+                let selected = select_queue_entry(&queue)?;
+                tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let current_queue = {
+                    let mut statement =
+                        tx.prepare("SELECT path FROM queue WHERE shell = ?1 ORDER BY id")?;
+                    let entries =
+                        statement.query_map([queue_id.as_str()], |row| row.get::<_, String>(0))?;
+                    entries
+                        .collect::<Result<Vec<_>, _>>()?
+                        .into_iter()
+                        .map(PathBuf::from)
+                        .collect::<Vec<_>>()
+                };
+                if current_queue != queue {
+                    return Err("queue changed while selecting; please try again".into());
+                }
+                selected
+            }
             Some(value) => value
                 .to_str()
                 .ok_or("invalid queue number")?
@@ -341,5 +377,128 @@ fn read_queue(path: &Path) -> io::Result<Vec<PathBuf>> {
         Ok(data) => Ok(data.lines().map(PathBuf::from).collect()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(error) => Err(error),
+    }
+}
+
+// The shell captures stdout, so the picker talks directly to the terminal.
+fn select_queue_entry(queue: &[PathBuf]) -> Result<usize, Box<dyn std::error::Error>> {
+    let mut tty = if unsafe { libc::isatty(libc::STDERR_FILENO) } == 1 {
+        let fd = unsafe { libc::dup(libc::STDERR_FILENO) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        unsafe { fs::File::from_raw_fd(fd) }
+    } else {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .map_err(|_| "interactive pop requires a terminal")?
+    };
+    let fd = tty.as_raw_fd();
+    let mut original = std::mem::MaybeUninit::<libc::termios>::uninit();
+    if unsafe { libc::tcgetattr(fd, original.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let original = unsafe { original.assume_init() };
+    let mut raw = original;
+    unsafe { libc::cfmakeraw(&mut raw) };
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    struct Restore(libc::c_int, libc::termios);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            unsafe { libc::tcsetattr(self.0, libc::TCSANOW, &self.1) };
+        }
+    }
+    let _restore = Restore(fd, original);
+    let mut selected = 0usize;
+    let mut first = 0usize;
+    let mut previous_lines = 0usize;
+    loop {
+        let mut size = std::mem::MaybeUninit::<libc::winsize>::zeroed();
+        let (rows, columns) =
+            if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, size.as_mut_ptr()) } == 0 {
+                let size = unsafe { size.assume_init() };
+                (
+                    if size.ws_row == 0 {
+                        24
+                    } else {
+                        usize::from(size.ws_row).max(3)
+                    },
+                    if size.ws_col == 0 {
+                        80
+                    } else {
+                        usize::from(size.ws_col).max(20)
+                    },
+                )
+            } else {
+                (24, 80)
+            };
+        let visible = rows.saturating_sub(3).max(1).min(queue.len());
+        if selected < first {
+            first = selected;
+        }
+        if selected >= first + visible {
+            first = selected + 1 - visible;
+        }
+        if previous_lines > 0 {
+            write!(tty, "\x1b[{}A", previous_lines)?;
+        }
+        write!(tty, "\r\x1b[2KSelect: arrows, Enter; Esc cancels\r\n")?;
+        for index in first..first + visible {
+            let path: String = queue[queue.len() - 1 - index]
+                .to_string_lossy()
+                .chars()
+                .flat_map(|c| {
+                    if c.is_control() {
+                        c.escape_default().collect::<Vec<_>>()
+                    } else {
+                        vec![c]
+                    }
+                })
+                .collect();
+            let line = format!(
+                "{} {}  {}",
+                if index == selected { ">" } else { " " },
+                index + 1,
+                path
+            );
+            // Limit each row so redrawing stays within the visible region.
+            let line: String = line.chars().take(columns.saturating_sub(1)).collect();
+            write!(tty, "\r\x1b[2K{line}\r\n")?;
+        }
+        previous_lines = visible + 1;
+        tty.flush()?;
+        let mut byte = [0u8; 1];
+        tty.read_exact(&mut byte)?;
+        match byte[0] {
+            b'\r' | b'\n' => return Ok(selected + 1),
+            3 | b'q' => return Err("selection cancelled".into()),
+            27 => {
+                let mut pollfd = libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                if unsafe { libc::poll(&mut pollfd, 1, 50) } <= 0 {
+                    return Err("selection cancelled".into());
+                }
+                tty.read_exact(&mut byte)?;
+                if byte[0] == b'[' || byte[0] == b'O' {
+                    if unsafe { libc::poll(&mut pollfd, 1, 50) } <= 0 {
+                        continue;
+                    }
+                    tty.read_exact(&mut byte)?;
+                    match byte[0] {
+                        b'A' => selected = selected.saturating_sub(1),
+                        b'B' => selected = (selected + 1).min(queue.len() - 1),
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
